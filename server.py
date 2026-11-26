@@ -373,7 +373,7 @@ def get_gemba(c, gid):
     if not row: raise HTTPException(404,'Không tìm thấy Gemba')
     out=dict(row)
     out['code']='GB-'+str(out['id']).zfill(5)
-    out['assignments']=[dict(x) for x in c.execute('''SELECT a.*,u.name AS name,u.code AS code FROM assignments a JOIN users u ON u.id=a.user_id WHERE a.gemba_id=? ORDER BY a.id''',(gid,)).fetchall()]
+    out['assignments']=[dict(x) for x in c.execute('''SELECT a.*,u.name AS name,u.code AS code,u.department AS department,u.branch AS assigned_branch FROM assignments a JOIN users u ON u.id=a.user_id WHERE a.gemba_id=? ORDER BY a.id''',(gid,)).fetchall()]
     out['history']=[dict(x) for x in c.execute('''SELECT h.*,u.name AS actor FROM history h JOIN users u ON u.id=h.user_id WHERE h.gemba_id=? ORDER BY h.id DESC''',(gid,)).fetchall()]
     out['pig_count']=c.execute('SELECT count(*) AS n FROM pig WHERE gemba_id=?',(gid,)).fetchone()['n']
     return out
@@ -385,6 +385,39 @@ def list_gembas(request: Request):
         get_user(request,c);sweep(c)
         ids=[r['id'] for r in c.execute('SELECT id FROM gembas ORDER BY id DESC LIMIT 1000').fetchall()]
         return [get_gemba(c,i) for i in ids]
+
+
+@app.get('/api/alerts')
+def alerts(request: Request):
+    """In-app alerts for assignees and creators. No external SMS/push is implied."""
+    with db() as c:
+        u=get_user(request,c)
+        sweep(c)
+        now=datetime.now(timezone.utc)
+        results=[]
+        rows=c.execute("""SELECT g.id, g.problem, g.deadline, g.status, g.review_round,
+            a.done, a.done_at, us.department
+            FROM assignments a JOIN gembas g ON g.id=a.gemba_id
+            JOIN users us ON us.id=a.user_id
+            WHERE a.user_id=? AND g.status!='passed' ORDER BY g.id DESC""",(u['id'],)).fetchall()
+        for row in rows:
+            x=dict(row)
+            if x['done']: continue
+            until=to_dt(x['deadline'])
+            if not until: continue
+            secs=(until-now).total_seconds()
+            level='overdue' if secs<0 else ('soon' if secs<=86400 else 'assigned')
+            title=('Quá hạn xử lý' if level=='overdue' else 'Sắp hết hạn (24 giờ)' if level=='soon' else 'Gemba được giao')
+            if x['status']=='rework': title='Yêu cầu khắc phục lại · '+title
+            results.append({'id':f"assignment-{x['id']}",'gemba_id':x['id'],
+                'type':level, 'title':title, 'department':x['department'] or 'Chưa xác định bộ phận',
+                'problem':x['problem'], 'deadline':x['deadline']})
+        for row in c.execute("""SELECT id, problem, deadline FROM gembas
+            WHERE creator_id=? AND status='awaiting_review' ORDER BY id DESC""",(u['id'],)).fetchall():
+            results.append({'id':f"review-{row['id']}",'gemba_id':row['id'],
+                'type':'review','title':'Chờ bạn kiểm tra và đánh giá',
+                'department':'Người Gemba','problem':row['problem'],'deadline':row['deadline']})
+        return results
 
 
 @app.get('/api/gembas/{gid}')
