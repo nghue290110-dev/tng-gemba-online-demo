@@ -1,0 +1,32 @@
+TNG GEMBA ONLINE DEMO — BẢN V3: QUẢN TRỊ HỆ THỐNG
+
+Ba file cần thay thế trên GitHub tại cùng cấp với file Dockerfile:
+  1. server.py
+  2. app.js
+  3. index.html
+
+KHÔNG tải file HUONG_DAN_CAP_NHAT.txt vào GitHub cũng được.
+
+1) Vào https://github.com/nghue290110-dev/tng-gemba-online-demo
+2) Chọn Add file > Upload files, đưa 3 file trên vào, chọn Commit changes.
+3) Render hiện đang tự cập nhật TẮT, nên mở Render dashboard, chọn dịch vụ
+   'tng-gemba-online-test' > Manual Deploy > Deploy latest commit.
+4) Dùng https://tng-gemba-online-test.onrender.com
+5) Đăng nhập Admin > Trang chủ > ⚙ Quản trị hệ thống > Cài đặt hệ thống.
+
+Các thiết lập:
+- Cảnh báo trước hạn: 1–168 giờ
+- Hạn mặc định: 1–30 ngày
+- Bật/tắt ghi PIG khi quá hạn hoặc không đạt trong hạn
+- Chọn màu các trạng thái
+- Thêm, đổi tên, ẩn/hiện danh mục chi nhánh và phòng ban
+- Danh sách quản lý, phân quyền, khóa/mở người dùng, nhập CSV vẫn hoạt động
+
+LƯU Ý QUAN TRỌNG:
+- Render Free + SQLite hiện lưu trên ổ đĩa tạm. Triển khai lại có thể mất dữ liệu,
+  kể cả tài khoản, các cấu hình và hồ sơ Gemba. Không dùng thông tin thật.
+- Thay mã nguồn qua GitHub vẫn bắt buộc để thêm chức năng mới; cài đặt ở trên
+  có thể sửa ngay trong app sau lần cập nhật V3 này.
+- Giao diện thay đổi theo cấu hình, nhưng dữ liệu chỉ ổn định lâu dài khi nâng cấp
+  lưu trữ (ví dụ PostgreSQL hay ổ đĩa bền vững).
+- Bản V3 giữ nguyên backend xử lý Gemba; không chuyển dữ liệu về Google Sheets.

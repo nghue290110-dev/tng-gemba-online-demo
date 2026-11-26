@@ -83,6 +83,16 @@ def init():
     with db() as c:
         c.executescript('''
         PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS system_settings (
+          key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_by INTEGER,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS organization_units (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          kind TEXT NOT NULL CHECK(kind IN ('branch','department')),
+          name TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+          UNIQUE(kind,name)
+        );
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           code TEXT UNIQUE NOT NULL, name TEXT NOT NULL, branch TEXT NOT NULL DEFAULT 'Bông',
@@ -125,6 +135,17 @@ def init():
           note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
         );
         ''')
+        defaults = {
+          'alert_hours': 24, 'default_due_days': 2,
+          'pig_overdue': True, 'pig_failed': True,
+          'color_new': '#ffffff', 'color_done': '#e4f7e9',
+          'color_pending': '#fff5d6', 'color_review': '#f0e8ff'
+        }
+        for key, value in defaults.items():
+            c.execute('INSERT OR IGNORE INTO system_settings(key,value,updated_at) VALUES(?,?,?)',
+                      (key,json.dumps(value),now_iso()))
+        for branch in ('Bông','Việt Thái'):
+            c.execute('INSERT OR IGNORE INTO organization_units(kind,name) VALUES(?,?)',('branch',branch))
         # Owner must configure an admin password; never ship a public fixed admin credential.
         if c.execute('SELECT count(*) AS n FROM users').fetchone()['n'] == 0:
             email = os.environ.get('ADMIN_EMAIL', 'admin@demo.local').strip().lower()
@@ -188,13 +209,29 @@ def pig_insert(c, gid, uid, rnd, reason, detail):
     c.execute('INSERT OR IGNORE INTO pig(gemba_id,user_id,round,reason,detail,created_at) VALUES(?,?,?,?,?,?)', (gid, uid, rnd, reason, detail, now_iso()))
 
 
+def get_settings(c):
+    return {r['key']:json.loads(r['value']) for r in c.execute('SELECT key,value FROM system_settings')}
+
+
+def flag(c, key):
+    row=c.execute('SELECT value FROM system_settings WHERE key=?',(key,)).fetchone()
+    return bool(json.loads(row['value'])) if row else True
+
+
+def add_organization(c, branch, department):
+    for kind,name in (('branch',branch),('department',department)):
+        name=(name or '').strip()
+        if name:
+            c.execute('INSERT OR IGNORE INTO organization_units(kind,name) VALUES(?,?)',(kind,name))
+
+
 def sweep(c):
     rows = c.execute('''SELECT g.id AS gid,g.review_round,g.deadline,a.user_id,a.done,a.done_at
       FROM assignments a JOIN gembas g ON g.id=a.gemba_id WHERE g.status != 'passed' ''').fetchall()
     current = datetime.now(timezone.utc)
     for a in rows:
         deadline = to_dt(a['deadline'])
-        if deadline and ((a['done'] and to_dt(a['done_at']) and to_dt(a['done_at']) > deadline) or (not a['done'] and current > deadline)):
+        if flag(c,'pig_overdue') and deadline and ((a['done'] and to_dt(a['done_at']) and to_dt(a['done_at']) > deadline) or (not a['done'] and current > deadline)):
             pig_insert(c, a['gid'], a['user_id'], a['review_round'], 'overdue', 'Xử lý sau hạn' if a['done'] else 'Quá hạn chưa xử lý xong')
 
 
@@ -275,6 +312,7 @@ def create_user(p: UserPayload, request: Request):
                 (p.code.strip().upper(),p.name.strip(),p.email.strip().lower(),p.branch.strip(),p.department.strip(),p.title.strip(),p.role,int(p.active),password_hash(pwd),now_iso()))
         except sqlite3.IntegrityError:
             raise HTTPException(409, 'Mã nhân viên hoặc email đã có')
+        add_organization(c,p.branch,p.department)
         return {'id':cur.lastrowid,'temporary_password':pwd}
 
 
@@ -301,10 +339,14 @@ def patch_user(uid: int, p: UserUpdate, request: Request):
             if len(values['password']) < 8: raise HTTPException(400,'Mật khẩu tối thiểu 8 ký tự')
             values['password'] = password_hash(values['password'])
         if 'active' in values: values['active'] = int(values['active'])
+        if target['role']=='admin' and (values.get('active') == 0 or values.get('role','admin') != 'admin') and c.execute("SELECT count(*) AS n FROM users WHERE role='admin' AND active=1").fetchone()['n']<=1:
+            raise HTTPException(400,'Không thể khoá hoặc hạ quyền Admin hoạt động cuối cùng')
         if uid == u['id'] and (values.get('active') == 0 or values.get('role','admin') != 'admin'):
             raise HTTPException(400,'Không thể tự khoá hoặc hạ quyền chính mình')
         if values:
             c.execute('UPDATE users SET '+','.join(k+'=?' for k in values)+' WHERE id=?', (*values.values(),uid))
+            updated=c.execute('SELECT branch,department FROM users WHERE id=?',(uid,)).fetchone()
+            add_organization(c,updated['branch'],updated['department'])
         return {'ok':True}
 
 
@@ -333,6 +375,7 @@ async def import_users(request: Request, file: UploadFile = File(...)):
             try:
                 c.execute('''INSERT INTO users(code,name,email,branch,department,title,role,password,created_at) VALUES(?,?,?,?,?,?,?,?,?)''',
                   (code,name,email,row.get('branch') or 'Bông',row.get('department') or '',row.get('title') or '',role,password_hash(password),now_iso()))
+                add_organization(c,row.get('branch') or 'Bông',row.get('department') or '')
                 results.append({'row':idx,'name':name,'email':email,'password':password})
             except sqlite3.IntegrityError:
                 results.append({'row':idx,'error':'Mã hoặc email đã tồn tại'})
@@ -406,8 +449,9 @@ def alerts(request: Request):
             until=to_dt(x['deadline'])
             if not until: continue
             secs=(until-now).total_seconds()
-            level='overdue' if secs<0 else ('soon' if secs<=86400 else 'assigned')
-            title=('Quá hạn xử lý' if level=='overdue' else 'Sắp hết hạn (24 giờ)' if level=='soon' else 'Gemba được giao')
+            hours=get_settings(c).get('alert_hours',24)
+            level='overdue' if secs<0 else ('soon' if secs<=hours*3600 else 'assigned')
+            title=('Quá hạn xử lý' if level=='overdue' else f'Sắp hết hạn ({hours} giờ)' if level=='soon' else 'Gemba được giao')
             if x['status']=='rework': title='Yêu cầu khắc phục lại · '+title
             results.append({'id':f"assignment-{x['id']}",'gemba_id':x['id'],
                 'type':level, 'title':title, 'department':x['department'] or 'Chưa xác định bộ phận',
@@ -444,7 +488,7 @@ def mark_done(aid: int,p: DonePayload, request: Request):
         if a['user_id']!=u['id'] and not is_admin(u):raise HTTPException(403,'Chỉ người được giao mới được đánh dấu')
         timestamp=now_iso() if p.done else None
         c.execute('UPDATE assignments SET done=?,done_at=?,note=?,photo=? WHERE id=?', (int(p.done),timestamp,p.note.strip(),p.photo,aid))
-        if p.done and to_dt(timestamp)>to_dt(g['deadline']):
+        if flag(c,'pig_overdue') and p.done and to_dt(timestamp)>to_dt(g['deadline']):
             pig_insert(c,g['id'],a['user_id'],g['review_round'],'overdue','Xử lý xong sau thời hạn')
         pending=c.execute('SELECT count(*) AS n FROM assignments WHERE gemba_id=? AND done=0',(g['id'],)).fetchone()['n']
         next_status='awaiting_review' if pending==0 else ('rework' if g['review_round']>1 else 'open')
@@ -473,7 +517,7 @@ def review(gid:int,p:ReviewPayload,request:Request):
             event(c,gid,u['id'],'passed',p.note or 'Đạt')
         else:
             # Do not accuse a user after deadline unless they have an overdue event.
-            if datetime.now(timezone.utc)<=to_dt(g['deadline']):
+            if flag(c,'pig_failed') and datetime.now(timezone.utc)<=to_dt(g['deadline']):
                 for a in c.execute('SELECT user_id FROM assignments WHERE gemba_id=?',(gid,)):
                     pig_insert(c,gid,a['user_id'],g['review_round'],'failed',p.note or 'Đánh giá không đạt trong thời hạn')
             c.execute('UPDATE assignments SET done=0,done_at=NULL WHERE gemba_id=?',(gid,))
@@ -549,3 +593,81 @@ def reset_demo(p:ResetPayload,request:Request):
 @app.get('/api/health')
 def health():
     return {'status':'ok','demo':True}
+
+
+# Admin system configuration: persisted in the shared database, never only in browser storage.
+@app.get('/api/system-settings')
+def system_settings(request:Request):
+    with db() as c:
+        get_user(request,c)
+        return {'settings':get_settings(c),
+                'units':[dict(row) for row in c.execute('SELECT * FROM organization_units ORDER BY kind,name')],
+                'storage':'SQLite; Render Free filesystem is ephemeral (DEMO only)'}
+
+
+class SettingUpdate(BaseModel):
+    alert_hours:int=Field(ge=1,le=168)
+    default_due_days:int=Field(ge=1,le=30)
+    pig_overdue:bool=True
+    pig_failed:bool=True
+    color_new:str='#ffffff'
+    color_done:str='#e4f7e9'
+    color_pending:str='#fff5d6'
+    color_review:str='#f0e8ff'
+
+
+@app.put('/api/system-settings')
+def update_system_settings(p:SettingUpdate,request:Request):
+    with db() as c:
+        u=get_user(request,c);admin_only(u)
+        values=p.model_dump()
+        for k in ('color_new','color_done','color_pending','color_review'):
+            if not re.fullmatch(r'#[0-9a-fA-F]{6}',values[k]):
+                raise HTTPException(400,'Màu phải có dạng #RRGGBB')
+        for k,value in values.items():
+            c.execute('INSERT INTO system_settings(key,value,updated_by,updated_at) VALUES(?,?,?,?) '
+                      'ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_by=excluded.updated_by,updated_at=excluded.updated_at',
+                      (k,json.dumps(value),u['id'],now_iso()))
+        return {'ok':True,'settings':get_settings(c)}
+
+
+class UnitCreate(BaseModel):
+    kind:str
+    name:str=Field(min_length=2,max_length=100)
+
+
+@app.post('/api/organization-units')
+def add_unit(p:UnitCreate,request:Request):
+    with db() as c:
+        admin_only(get_user(request,c))
+        if p.kind not in ('branch','department'): raise HTTPException(400,'Loại đơn vị không hợp lệ')
+        name=p.name.strip()
+        if len(name)<2:raise HTTPException(400,'Tên quá ngắn')
+        try:
+            out=c.execute('INSERT INTO organization_units(kind,name) VALUES(?,?)',(p.kind,name))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409,'Đơn vị đã có trong danh sách')
+        return {'id':out.lastrowid,'ok':True}
+
+
+class UnitUpdate(BaseModel):
+    name:Optional[str]=None
+    active:Optional[bool]=None
+
+
+@app.patch('/api/organization-units/{unit_id}')
+def edit_unit(unit_id:int,p:UnitUpdate,request:Request):
+    with db() as c:
+        admin_only(get_user(request,c))
+        x=c.execute('SELECT * FROM organization_units WHERE id=?',(unit_id,)).fetchone()
+        if not x:raise HTTPException(404,'Không tìm thấy đơn vị')
+        data=p.model_dump(exclude_none=True)
+        if 'name' in data:
+            data['name']=data['name'].strip()
+            if len(data['name'])<2:raise HTTPException(400,'Tên quá ngắn')
+        if 'active' in data:data['active']=int(data['active'])
+        try:
+            if data:c.execute('UPDATE organization_units SET '+','.join(k+'=?' for k in data)+' WHERE id=?',(*data.values(),unit_id))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409,'Tên đơn vị bị trùng')
+        return {'ok':True}
